@@ -66,7 +66,7 @@ func Dial(addr string, opts ...ConnOption) (*Client, error) {
 		ConnServerHostname(host),
 	}, opts...)
 
-	c, err := newConn(nil, opts...)
+	c, err := newConn(addr, nil, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -89,7 +89,7 @@ func Dial(addr string, opts ...ConnOption) (*Client, error) {
 
 // New establishes an AMQP client connection over conn.
 func New(conn net.Conn, opts ...ConnOption) (*Client, error) {
-	c, err := newConn(conn, opts...)
+	c, err := newConn("", conn, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -359,6 +359,16 @@ func (s *Sender) send(ctx context.Context, msg *Message) (chan deliveryState, er
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.link.err != nil {
+		s.link.Close(ctx)
+
+		newLink, err := s.link.recoveryFunc(s.link.err)
+		if err != nil {
+			return nil, errorErrorf("link in error state: %+v, attempted to recovery but received error: %+v", s.link.err, err)
+		}
+		s.link = newLink
+	}
+
 	s.buf.reset()
 	err := msg.marshal(&s.buf)
 	if err != nil {
@@ -410,6 +420,17 @@ func (s *Sender) send(ctx context.Context, msg *Message) (chan deliveryState, er
 		select {
 		case s.link.transfers <- fr:
 		case <-s.link.done:
+			if s.link.err != nil {
+				s.link.Close(ctx)
+
+				newLink, err := s.link.recoveryFunc(s.link.err)
+				if err != nil {
+					return nil, errorErrorf("link in error state: %+v, attempted to recovery but received error: %+v", s.link.err, err)
+				}
+				s.link = newLink
+				return s.send(ctx, msg)
+			}
+
 			return nil, s.link.err
 		case <-ctx.Done():
 			return nil, errorWrapf(ctx.Err(), "awaiting send")
@@ -805,6 +826,8 @@ type link struct {
 	source        *source
 	target        *target
 	properties    map[symbol]interface{} // additional properties sent upon link attach
+	recoveryFunc  func(linkError error) (*link, error)
+	linkOptions   []LinkOption
 
 	// "The delivery-count is initialized by the sender when a link endpoint is created,
 	// and is incremented whenever a message is sent. Only the sender MAY independently
@@ -947,6 +970,7 @@ func newLink(s *Session, r *Receiver, opts []LinkOption) (*link, error) {
 		close:         make(chan struct{}),
 		done:          make(chan struct{}),
 		receiverReady: make(chan struct{}, 1),
+		linkOptions:   opts,
 	}
 
 	// configure options
@@ -1528,6 +1552,34 @@ func LinkMaxMessageSize(size uint64) LinkOption {
 	}
 }
 
+// LinkRecoveryFunc is invoked when a link error occurs and
+// allows you to create a new link using the newLink func or return an error
+// which will be propogated to the sender/receiver next time they are used
+type LinkRecoveryFunc func(linkError error, currentLinkOptions []LinkOption, createLink CreateLinkFunc) (*link, error)
+
+// CreateLinkFunc is used by a user implimenting a LinkRecoveryFunc
+// it can be invoked to create a new link instance which will be used
+// instead of the existing error'd link
+type CreateLinkFunc func(...LinkOption) (*link, error)
+
+type RecoveredLink = link
+
+// LinkRecoveryOption sets a callback which can be used to
+// reconnect when a link lost
+//
+// The callback used create a replacement link
+func LinkRecoveryOption(recoveryFunc LinkRecoveryFunc) LinkOption {
+	return func(l *link) error {
+		l.recoveryFunc = func(linkError error) (*link, error) {
+			createLinkWrapper := func(options ...LinkOption) (*link, error) {
+				return newLink(l.session, l.receiver, options)
+			}
+			return recoveryFunc(linkError, l.linkOptions, createLinkWrapper)
+		}
+		return nil
+	}
+}
+
 // Receiver receives messages on a single AMQP link.
 type Receiver struct {
 	link         *link                   // underlying link
@@ -1566,6 +1618,22 @@ func (r *Receiver) Receive(ctx context.Context) (*Message, error) {
 		msg.receiver = r
 		return &msg, nil
 	case <-r.link.done:
+		if r.link.err != nil {
+			err := r.link.Close(ctx)
+			if err != nil {
+				return nil, errorErrorf("link in error state: %+v, attempted to close and received error: %+v", r.link.err, err)
+			}
+
+			newLink, err := r.link.recoveryFunc(r.link.err)
+			if err != nil {
+				return nil, errorErrorf("link in error state: %+v, attempted to recovery but received error: %+v", r.link.err, err)
+			}
+
+			r.link = newLink
+
+			// retry the receive operation with the new link in place
+			return r.Receive(ctx)
+		}
 		return nil, r.link.err
 	case <-ctx.Done():
 		return nil, ctx.Err()

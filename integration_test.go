@@ -1,5 +1,3 @@
-// +build integration
-
 package amqp_test
 
 import (
@@ -515,6 +513,103 @@ func TestIntegrationSend(t *testing.T) {
 
 			if dead := *q.CountDetails.DeadLetterMessageCount; dead > 0 {
 				t.Fatalf("Expected DeadLetterMessageCount to be 0, but it was %d", dead)
+			}
+		})
+	}
+}
+
+func TestIntegrationSend_LinkRecovery(t *testing.T) {
+	queueName, queuesClient, cleanup := newTestQueue(t, "receive")
+	defer cleanup()
+
+	tests := []struct {
+		label string
+		data  []string
+	}{
+		{
+			label: "3 send, small payload",
+			data: []string{
+				"2Hey there!",
+				"2Hi there!",
+				"2Ho there!",
+			},
+		},
+	}
+
+	var totalMessages int
+
+	for _, tt := range tests {
+		t.Run(tt.label, func(t *testing.T) {
+			checkLeaks := leaktest.CheckTimeout(t, 60*time.Second)
+
+			// Create client
+			client := newSBClient(t, tt.label)
+			defer client.Close()
+
+			// Open a session
+			session, err := client.NewSession()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			recoveryInvoked := false
+			recoveryFunc := func(linkError error, currentLinkOptions []amqp.LinkOption, createLink amqp.CreateLinkFunc) (*amqp.RecoveredLink, error) {
+				recoveryInvoked = true
+				if strings.Contains(linkError.Error(), "detach") {
+					return createLink(currentLinkOptions...)
+				}
+
+				t.Errorf("linkError unexpected type, error: %+v", linkError)
+				return nil, fmt.Errorf("linkError unexpected type, error: %+v", linkError)
+			}
+
+			recoveryOption := amqp.LinkRecoveryOption(recoveryFunc)
+
+			// Create a sender
+			sender, err := session.NewSender(
+				amqp.LinkTargetAddress(queueName),
+				recoveryOption,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			//Wait for SB to detach link
+			time.Sleep(12 * time.Minute)
+
+			for i, data := range tt.data {
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				err = sender.Send(ctx, amqp.NewMessage([]byte(data)))
+				cancel()
+				if err != nil {
+					t.Errorf("Error after %d sends: %+v", i, err)
+					return
+				}
+			}
+			testClose(t, sender.Close)
+			client.Close() // close before leak check
+
+			checkLeaks() // this is done here because queuesClient starts additional goroutines
+
+			// Wait for Azure to update stats
+			time.Sleep(1 * time.Second)
+
+			q, err := queuesClient.Get(context.Background(), resourceGroup, namespace, queueName)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			totalMessages += len(tt.data)
+			if amc := *q.CountDetails.ActiveMessageCount; int(amc) != totalMessages {
+				t.Fatalf("Expected ActiveMessageCount to be %d, but it was %d", totalMessages, amc)
+			}
+
+			if dead := *q.CountDetails.DeadLetterMessageCount; dead > 0 {
+				t.Fatalf("Expected DeadLetterMessageCount to be 0, but it was %d", dead)
+			}
+
+			if !recoveryInvoked {
+				t.Fatal("Expected recovery function to be invoked when sending after the link has been detached due to >5 mins idle time")
 			}
 		})
 	}

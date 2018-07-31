@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -129,6 +130,39 @@ func ConnMaxSessions(n int) ConnOption {
 	}
 }
 
+// ConnRecoveryFunc is invoked when a link error occurs and
+// allows you to create a new link using the newLink func or return an error
+// which will be propogated to the sender/receiver next time they are used
+type ConnRecoveryFunc func(connError error, currentConnOptions []ConnOption, createConn CreateConnFunc) (*conn, error)
+
+// CreateConnFunc is used by a user implimenting a LinkRecoveryFunc
+// it can be invoked to create a new link instance which will be used
+// instead of the existing error'd link
+type CreateConnFunc func(...ConnOption) (*conn, error)
+
+// RecoveredConn the recovered connection type to allow external users to define recoveryFuncs
+type RecoveredConn = conn
+
+// ConnRecoveryOption sets a callback which can be used to
+// reconnect when a link lost
+//
+// The callback used create a replacement link
+func ConnRecoveryOption(recoveryFunc ConnRecoveryFunc) ConnOption {
+	return func(c *conn) error {
+		c.recoveryFunc = func(connError error) (*conn, error) {
+			createConnWrapper := func(options ...ConnOption) (*conn, error) {
+				client, err := Dial(c.address, c.connOptions...)
+				if err != nil {
+					return nil, fmt.Errorf("failed to recover connection, error when dialing: %+v", err)
+				}
+				return client.conn, nil
+			}
+			return recoveryFunc(connError, c.connOptions, createConnWrapper)
+		}
+		return nil
+	}
+}
+
 // ConnProperty sets an entry in the connection properties map sent to the server.
 //
 // This option can be used multiple times.
@@ -192,6 +226,11 @@ type conn struct {
 	txFrame chan frame // AMQP frames to be sent by connWriter
 	txBuf   buffer     // buffer for marshaling frames before transmitting
 	txDone  chan struct{}
+
+	// recovery
+	recoveryFunc func(connError error) (*conn, error) // provides a method for recovering a failed connection
+	connOptions  []ConnOption                         // contains the options used to create this connection
+	address      string                               // address used to dial the connection
 }
 
 type newSessionResp struct {
@@ -199,7 +238,7 @@ type newSessionResp struct {
 	err     error
 }
 
-func newConn(netConn net.Conn, opts ...ConnOption) (*conn, error) {
+func newConn(addr string, netConn net.Conn, opts ...ConnOption) (*conn, error) {
 	c := &conn{
 		net:              netConn,
 		maxFrameSize:     DefaultMaxFrameSize,
@@ -217,6 +256,8 @@ func newConn(netConn net.Conn, opts ...ConnOption) (*conn, error) {
 		delSession:       make(chan *Session),
 		txFrame:          make(chan frame),
 		txDone:           make(chan struct{}),
+		connOptions:      opts,
+		address:          addr,
 	}
 
 	// apply options
@@ -241,7 +282,7 @@ func (c *conn) initTLSConfig() {
 }
 
 func (c *conn) start() error {
-	// start reader
+	// start readerconnReader
 	go c.connReader()
 
 	// run connection establishment state machine
